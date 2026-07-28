@@ -5,7 +5,9 @@
 //! state and bridge provider-specific transports, but it should not reimplement
 //! the Agent core; otherwise API/MCP/UI behavior will drift.
 
+pub mod answer_layer;
 pub mod cancel;
+pub mod cli_provider;
 pub mod context;
 pub mod events;
 pub mod permissions;
