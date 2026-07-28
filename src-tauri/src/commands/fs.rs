@@ -2493,7 +2493,20 @@ mod tests {
 
     #[test]
     fn allow_absolute_write_paths() {
-        assert!(require_absolute_path("write_file", "/tmp/project/wiki/sources/page.md").is_ok());
+        // The bare-root form is the one shape of "absolute" that is genuinely
+        // platform-specific. `/tmp/...` is absolute on Unix, but on Windows a
+        // drive-less rooted path is *drive-relative*: it resolves against the
+        // process's current drive, which is exactly the ambient-state
+        // dependency this guard exists to reject. `Path::is_absolute()` says
+        // `false` there and `require_absolute_path` is right to refuse it, so
+        // assert each platform's own absolute form rather than hard-coding a
+        // Unix path. Every other form below is absolute on both platforms and
+        // stays ungated.
+        #[cfg(unix)]
+        let platform_absolute = "/tmp/project/wiki/sources/page.md";
+        #[cfg(windows)]
+        let platform_absolute = r"C:\tmp\project\wiki\sources\page.md";
+        assert!(require_absolute_path("write_file", platform_absolute).is_ok());
         assert!(require_absolute_path("write_file", "C:/project/wiki/sources/page.md").is_ok());
         assert!(require_absolute_path("write_file", r"C:\project\wiki\sources\page.md").is_ok());
         assert!(
@@ -2501,6 +2514,12 @@ mod tests {
         );
         assert!(require_absolute_path("write_file", "//server/share/wiki/sources/page.md").is_ok());
         assert!(require_absolute_path("write_file", "C:wiki/sources/page.md").is_err());
+        // Keep the Unix arm's string exercised on Windows too, asserting the
+        // outcome that platform actually owes us, so the gating above trades a
+        // hard-coded path for a platform-correct assertion rather than for a
+        // hole in the coverage.
+        #[cfg(windows)]
+        assert!(require_absolute_path("write_file", "/tmp/project/wiki/sources/page.md").is_err());
     }
 
     /// Pull the inner sync `copy_recursive` body out from
