@@ -60,3 +60,7 @@ jobs:
       - name: Check Rust build
         working-directory: src-tauri
         run: cargo build
+
+      - name: Run Rust tests
+        working-directory: src-tauri
+        run: cargo test
