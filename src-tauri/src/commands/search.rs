@@ -19,6 +19,11 @@ const MAX_PHRASE_OCC_COUNTED: usize = 10;
 const TITLE_TOKEN_WEIGHT: f64 = 5.0;
 const CONTENT_TOKEN_WEIGHT: f64 = 1.0;
 const SNIPPET_CONTEXT: usize = 80;
+/// An exact frontmatter-alias hit is the strongest authoring signal a page can
+/// carry. It outranks every phrase bonus so that a page whose alias the query
+/// spells cannot be displaced out of the candidate set by pages that merely
+/// carry more bulk text.
+const ALIAS_EXACT_BONUS: f64 = 120.0;
 const SEARCH_EMBEDDING_TIMEOUT_SECS: u64 = 8;
 const MAX_SEARCH_FILES: usize = 10_000;
 const MIN_GRAPH_RESULT_RATIO: f64 = 0.15;
@@ -49,6 +54,22 @@ pub struct ProjectSearchResult {
     pub graph_related_to: Vec<String>,
 }
 
+/// One recorded step-down from the retrieval mode the request asked for.
+/// Emitted instead of only writing to stderr, so a caller reading the response
+/// can tell "keyword, because the corpus has no match" apart from "keyword,
+/// because the embedding endpoint failed".
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SearchDegradation {
+    /// Where the step-down happened: `embedding`, `vectorSearch`, `vectorIndex`.
+    pub stage: String,
+    /// Mode that was requested or expected before this stage failed.
+    pub from: String,
+    /// Mode actually served after it.
+    pub to: String,
+    pub reason: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ProjectSearchResponse {
@@ -57,6 +78,21 @@ pub struct ProjectSearchResponse {
     pub token_hits: usize,
     pub vector_hits: usize,
     pub graph_hits: usize,
+    /// Mode the request was set up to serve, when that is not the mode served.
+    /// Set only if a degradation was recorded, and cleared when the served mode
+    /// ended up matching anyway. Omitted from the wire when absent, so existing
+    /// consumers see the response shape unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requested_mode: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub degradations: Vec<SearchDegradation>,
+}
+
+/// Query embedding plus any degradation incurred while obtaining it.
+#[derive(Debug, Clone, Default)]
+pub struct QueryEmbeddingOutcome {
+    pub embedding: Option<Vec<f32>>,
+    pub degradations: Vec<SearchDegradation>,
 }
 
 #[derive(Debug, Clone)]
@@ -110,14 +146,14 @@ pub async fn search_project(
     embedding_config: Option<SearchEmbeddingConfig>,
 ) -> Result<ProjectSearchResponse, String> {
     run_guarded_async("search_project", async move {
-        let query_embedding =
-            resolve_query_embedding(&query, query_embedding, embedding_config).await?;
+        let outcome = resolve_query_embedding(&query, query_embedding, embedding_config).await?;
         search_project_inner(
             project_path,
             query,
             top_k.unwrap_or(DEFAULT_RESULTS),
             include_content.unwrap_or(false),
-            query_embedding,
+            outcome.embedding,
+            outcome.degradations,
         )
         .await
     })
@@ -291,21 +327,40 @@ pub async fn resolve_query_embedding(
     query: &str,
     explicit_embedding: Option<Vec<f32>>,
     embedding_config: Option<SearchEmbeddingConfig>,
-) -> Result<Option<Vec<f32>>, String> {
+) -> Result<QueryEmbeddingOutcome, String> {
     if let Some(embedding) = explicit_embedding {
-        return validate_query_embedding(embedding).map(Some);
+        return validate_query_embedding(embedding).map(|embedding| QueryEmbeddingOutcome {
+            embedding: Some(embedding),
+            degradations: Vec::new(),
+        });
     }
     let Some(cfg) = embedding_config else {
-        return Ok(None);
+        return Ok(QueryEmbeddingOutcome::default());
     };
     if !cfg.enabled || cfg.endpoint.trim().is_empty() || cfg.model.trim().is_empty() {
-        return Ok(None);
+        return Ok(QueryEmbeddingOutcome::default());
     }
     match fetch_embedding_with_retry(query, &cfg, 0).await {
-        Ok(embedding) => validate_query_embedding(embedding).map(Some),
+        Ok(embedding) => validate_query_embedding(embedding).map(|embedding| {
+            QueryEmbeddingOutcome {
+                embedding: Some(embedding),
+                degradations: Vec::new(),
+            }
+        }),
         Err(err) => {
+            // Previously this was stderr-only, so a caller saw `mode: "keyword"`
+            // with no way to tell a configured-but-broken embedding endpoint
+            // apart from one that was never enabled (F-7).
             eprintln!("[Search] embedding disabled for this request: {err}");
-            Ok(None)
+            Ok(QueryEmbeddingOutcome {
+                embedding: None,
+                degradations: vec![SearchDegradation {
+                    stage: "embedding".to_string(),
+                    from: "hybrid".to_string(),
+                    to: "keyword".to_string(),
+                    reason: format!("query embedding unavailable: {err}"),
+                }],
+            })
         }
     }
 }
@@ -326,6 +381,7 @@ pub async fn search_project_inner(
     top_k: usize,
     include_content: bool,
     query_embedding: Option<Vec<f32>>,
+    mut degradations: Vec<SearchDegradation>,
 ) -> Result<ProjectSearchResponse, String> {
     if query.trim().is_empty() {
         return Err("query is required".to_string());
@@ -333,11 +389,11 @@ pub async fn search_project_inner(
     let limit = top_k.clamp(1, MAX_RESULTS);
     let tokens = tokenize_query(&query);
     let effective_tokens = if tokens.is_empty() {
-        vec![query.trim().to_lowercase()]
+        vec![fold_for_match(query.trim())]
     } else {
         tokens
     };
-    let query_phrase = trim_query_punctuation(&query.to_lowercase());
+    let phrases = phrase_candidates(&query);
     let mut results = Vec::new();
     let mut page_paths_by_stem = BTreeMap::new();
     let mut graph_pages = BTreeMap::new();
@@ -388,7 +444,7 @@ pub async fn search_project_inner(
                 entry.path(),
                 &content,
                 &effective_tokens,
-                &query_phrase,
+                &phrases,
                 &query,
                 include_content,
             );
@@ -429,6 +485,16 @@ pub async fn search_project_inner(
             match search_by_embedding(&project_path, embedding, limit.max(10)).await {
                 Ok(vector_results) => {
                     vector_hits = vector_results.len();
+                    if vector_hits == 0 {
+                        degradations.push(SearchDegradation {
+                            stage: "vectorIndex".to_string(),
+                            from: "hybrid".to_string(),
+                            to: "keyword".to_string(),
+                            reason:
+                                "vector index returned no chunks; the project may not be embedded"
+                                    .to_string(),
+                        });
+                    }
                     for (idx, vr) in vector_results.iter().enumerate() {
                         vector_rank.insert(vr.id.clone(), idx + 1);
                         vector_score.insert(vr.id.clone(), vr.score);
@@ -445,6 +511,12 @@ pub async fn search_project_inner(
                     eprintln!(
                         "[Search] vector search failed; falling back to keyword results: {err}"
                     );
+                    degradations.push(SearchDegradation {
+                        stage: "vectorSearch".to_string(),
+                        from: "hybrid".to_string(),
+                        to: "keyword".to_string(),
+                        reason: format!("vector search failed: {err}"),
+                    });
                 }
             }
         }
@@ -468,11 +540,24 @@ pub async fn search_project_inner(
         include_content,
     );
 
+    let mode = search_mode(token_rank.is_empty(), vector_hits, graph_hits).to_string();
+    // What the request was set up to serve, before anything fell over. Derived
+    // from a recorded degradation rather than guessed, and dropped when the
+    // served mode matched it anyway (graph expansion can restore `hybrid` even
+    // after the vector leg failed). A degraded run is then legible in the
+    // response instead of only in stderr (F-7).
+    let requested_mode = degradations
+        .first()
+        .map(|degradation| degradation.from.clone())
+        .filter(|requested| requested != &mode);
+
     Ok(ProjectSearchResponse {
-        mode: search_mode(token_rank.is_empty(), vector_hits, graph_hits).to_string(),
+        mode,
         token_hits: token_rank.len(),
         vector_hits,
         graph_hits,
+        requested_mode,
+        degradations,
         results,
     })
 }
@@ -683,6 +768,29 @@ fn extract_wikilinks(content: &str) -> Vec<String> {
     links
 }
 
+/// Human-readable suffix naming any degradation, for the `wiki.search` progress
+/// line. Empty when the served mode is the requested one — the common case must
+/// stay silent, or the signal is lost in noise.
+pub fn degradation_suffix(
+    requested_mode: Option<&str>,
+    degradations: &[SearchDegradation],
+) -> String {
+    if degradations.is_empty() && requested_mode.is_none() {
+        return String::new();
+    }
+    let reasons = degradations
+        .iter()
+        .map(|degradation| format!("{}: {}", degradation.stage, degradation.reason))
+        .collect::<Vec<_>>()
+        .join("; ");
+    match (requested_mode, reasons.is_empty()) {
+        (Some(requested), false) => format!(", DEGRADED from {requested} ({reasons})"),
+        (Some(requested), true) => format!(", DEGRADED from {requested}"),
+        (None, false) => format!(", DEGRADED ({reasons})"),
+        (None, true) => String::new(),
+    }
+}
+
 fn search_mode(token_rank_empty: bool, vector_hits: usize, graph_hits: usize) -> &'static str {
     if graph_hits > 0 {
         "hybrid"
@@ -816,25 +924,40 @@ fn score_file(
     path: &Path,
     content: &str,
     tokens: &[String],
-    query_phrase: &str,
+    phrases: &[String],
     query: &str,
     include_content: bool,
 ) -> Option<ProjectSearchResult> {
     let file_name = path.file_name().and_then(|s| s.to_str()).unwrap_or("");
     let title = extract_title(content, file_name);
     let title_text = format!("{title} {file_name}");
-    let title_lower = title_text.to_lowercase();
-    let content_lower = content.to_lowercase();
-    let stem = file_name.trim_end_matches(".md").to_lowercase();
+    // Everything below matches on folded text so that an unaccented query and
+    // an accented page (and the reverse) meet on the same spelling.
+    let title_folded = fold_for_match(&title_text);
+    let content_folded = fold_for_match(content);
+    let stem = fold_for_match(file_name.trim_end_matches(".md"));
+    let aliases = frontmatter_aliases(content);
 
-    let filename_exact = !query_phrase.is_empty() && stem == query_phrase;
-    let title_has_phrase = !query_phrase.is_empty() && title_lower.contains(query_phrase);
-    let content_phrase_occ =
-        count_occurrences(&content_lower, query_phrase).min(MAX_PHRASE_OCC_COUNTED);
-    let title_token_score = token_match_score(&title_text, tokens);
-    let content_token_score = token_match_score(content, tokens);
+    let filename_exact = phrases.iter().any(|phrase| stem == *phrase);
+    let alias_exact = phrases
+        .iter()
+        .any(|phrase| aliases.iter().any(|alias| alias == phrase));
+    let title_has_phrase = phrases
+        .iter()
+        .any(|phrase| title_folded.contains(phrase.as_str()));
+    // `phrases` is longest-first, so this picks the most specific phrase the
+    // page actually contains.
+    let content_phrase = phrases
+        .iter()
+        .find(|phrase| content_folded.contains(phrase.as_str()));
+    let content_phrase_occ = content_phrase
+        .map(|phrase| count_occurrences(&content_folded, phrase).min(MAX_PHRASE_OCC_COUNTED))
+        .unwrap_or(0);
+    let title_token_score = token_match_score(&title_folded, tokens);
+    let content_token_score = token_match_score(&content_folded, tokens);
 
     if !filename_exact
+        && !alias_exact
         && !title_has_phrase
         && content_phrase_occ == 0
         && title_token_score == 0
@@ -847,28 +970,36 @@ fn score_file(
         FILENAME_EXACT_BONUS
     } else {
         0.0
-    }) + (if title_has_phrase {
-        PHRASE_IN_TITLE_BONUS
-    } else {
-        0.0
-    }) + content_phrase_occ as f64 * PHRASE_IN_CONTENT_PER_OCC
+    }) + (if alias_exact { ALIAS_EXACT_BONUS } else { 0.0 })
+        + (if title_has_phrase {
+            PHRASE_IN_TITLE_BONUS
+        } else {
+            0.0
+        })
+        + content_phrase_occ as f64 * PHRASE_IN_CONTENT_PER_OCC
         + title_token_score as f64 * TITLE_TOKEN_WEIGHT
         + content_token_score as f64 * CONTENT_TOKEN_WEIGHT;
 
-    let snippet_anchor = if content_phrase_occ > 0 {
-        query_phrase.to_string()
-    } else {
+    // Priority order for the excerpt window: the matched phrase, then whichever
+    // query tokens the page actually carries, then the raw query as a last
+    // resort. `build_snippet_from_anchors` confines all of them to the body.
+    let folded_query = fold_for_match(query);
+    let mut anchors: Vec<&str> = Vec::new();
+    if let Some(phrase) = content_phrase {
+        anchors.push(phrase.as_str());
+    }
+    anchors.extend(
         tokens
             .iter()
-            .find(|token| content_lower.contains(token.as_str()))
-            .cloned()
-            .unwrap_or_else(|| query.to_string())
-    };
+            .filter(|token| content_folded.contains(token.as_str()))
+            .map(String::as_str),
+    );
+    anchors.push(folded_query.as_str());
 
     Some(ProjectSearchResult {
         path: relative_to_project(project_path, path),
         title,
-        snippet: build_snippet(content, &snippet_anchor),
+        snippet: build_snippet_from_anchors(content, &anchors),
         title_match: title_token_score > 0 || title_has_phrase,
         score,
         vector_score: None,
@@ -878,9 +1009,143 @@ fn score_file(
     })
 }
 
+/// Lowercase and strip the diacritic from one character.
+///
+/// Deliberately **1:1** — every input char yields exactly one output char, so a
+/// char offset into the folded string addresses the same char in the source and
+/// snippet windows stay aligned. That rules out the expanding folds (`ß`→`ss`,
+/// `æ`→`ae`, `œ`→`oe`), which are left untouched; none of them appear in the
+/// Spanish legal vocabulary this exists to serve. `char::to_lowercase` is taken
+/// one char at a time for the same reason.
+fn fold_char(c: char) -> char {
+    let lower = c.to_lowercase().next().unwrap_or(c);
+    match lower {
+        'à' | 'á' | 'â' | 'ã' | 'ä' | 'å' | 'ā' | 'ă' | 'ą' => 'a',
+        'ç' | 'ć' | 'ĉ' | 'ċ' | 'č' => 'c',
+        'ď' | 'đ' => 'd',
+        'è' | 'é' | 'ê' | 'ë' | 'ē' | 'ĕ' | 'ė' | 'ę' | 'ě' => 'e',
+        'ĝ' | 'ğ' | 'ġ' | 'ģ' => 'g',
+        'ĥ' | 'ħ' => 'h',
+        'ì' | 'í' | 'î' | 'ï' | 'ĩ' | 'ī' | 'ĭ' | 'į' | 'ı' => 'i',
+        'ĵ' => 'j',
+        'ķ' => 'k',
+        'ĺ' | 'ļ' | 'ľ' | 'ŀ' | 'ł' => 'l',
+        'ñ' | 'ń' | 'ņ' | 'ň' => 'n',
+        'ò' | 'ó' | 'ô' | 'õ' | 'ö' | 'ø' | 'ō' | 'ŏ' | 'ő' => 'o',
+        'ŕ' | 'ŗ' | 'ř' => 'r',
+        'ś' | 'ŝ' | 'ş' | 'š' => 's',
+        'ţ' | 'ť' | 'ŧ' => 't',
+        'ù' | 'ú' | 'û' | 'ü' | 'ũ' | 'ū' | 'ŭ' | 'ů' | 'ű' | 'ų' => 'u',
+        'ŵ' => 'w',
+        'ý' | 'ÿ' | 'ŷ' => 'y',
+        'ź' | 'ż' | 'ž' => 'z',
+        other => other,
+    }
+}
+
+/// Diacritic-folded, lowercased copy used for *all* matching, on both sides.
+///
+/// Applying the identical fold to page text and to the query is what makes
+/// `cedula` and `cédula` retrieve each other; folding only one side would make
+/// the relation one-way. Char count is preserved (see [`fold_char`]).
+pub fn fold_for_match(value: &str) -> String {
+    value.chars().map(fold_char).collect()
+}
+
+/// Contiguous runs of content words, in query order, with interrogative and
+/// function words removed.
+///
+/// `"Who is defendant counsel?"` yields `["defendant counsel"]` — the same
+/// phrase the bare keyword query produces — so wrapping a query in question
+/// form no longer costs it the phrase bonus that kept its page in the
+/// candidate set. A stop word breaks a run rather than being spliced out, so
+/// only words that really were adjacent in the query form a phrase.
+fn content_phrases(query: &str) -> Vec<String> {
+    let folded = fold_for_match(query);
+    let mut phrases = Vec::new();
+    let mut run: Vec<&str> = Vec::new();
+    for token in folded.split(is_query_separator) {
+        if token.chars().count() > 1 && !is_stop_word(token) {
+            run.push(token);
+            continue;
+        }
+        if run.len() > 1 {
+            phrases.push(run.join(" "));
+        }
+        run.clear();
+    }
+    if run.len() > 1 {
+        phrases.push(run.join(" "));
+    }
+    phrases
+}
+
+/// Every phrase worth scoring for this query, longest first.
+///
+/// The whole trimmed query stays at the front so a query carrying no stop
+/// words scores exactly as it did before this change; the content-word runs
+/// are additive fallbacks for the question forms.
+fn phrase_candidates(query: &str) -> Vec<String> {
+    let mut candidates = Vec::new();
+    let whole = trim_query_punctuation(&fold_for_match(query));
+    if !whole.is_empty() {
+        candidates.push(whole);
+    }
+    for phrase in content_phrases(query) {
+        if !candidates.contains(&phrase) {
+            candidates.push(phrase);
+        }
+    }
+    candidates.sort_by_key(|phrase| std::cmp::Reverse(phrase.split(' ').count()));
+    candidates
+}
+
+/// Aliases declared in a page's YAML frontmatter, folded for matching.
+///
+/// Handles both the inline (`aliases: ["a", "b"]`) and block (`- "a"`) forms.
+/// Parsed by hand rather than with a YAML crate because a malformed page must
+/// degrade to "no aliases" instead of failing the whole search.
+fn frontmatter_aliases(content: &str) -> Vec<String> {
+    let Some(block) = frontmatter_block(content) else {
+        return Vec::new();
+    };
+    let mut aliases = Vec::new();
+    let mut in_aliases = false;
+    for line in block.lines() {
+        let trimmed = line.trim();
+        if in_aliases {
+            if let Some(item) = trimmed.strip_prefix("- ") {
+                aliases.push(item.to_string());
+                continue;
+            }
+            // Any non-item line ends the sequence.
+            if !trimmed.is_empty() {
+                in_aliases = false;
+            }
+        }
+        let Some(rest) = trimmed
+            .strip_prefix("aliases:")
+            .or_else(|| trimmed.strip_prefix("alias:"))
+        else {
+            continue;
+        };
+        let rest = rest.trim();
+        if rest.is_empty() {
+            in_aliases = true;
+            continue;
+        }
+        let inline = rest.trim_start_matches('[').trim_end_matches(']');
+        aliases.extend(inline.split(',').map(ToOwned::to_owned));
+    }
+    aliases
+        .into_iter()
+        .map(|alias| fold_for_match(alias.trim().trim_matches('"').trim_matches('\'').trim()))
+        .filter(|alias| !alias.is_empty())
+        .collect()
+}
+
 pub fn tokenize_query(query: &str) -> Vec<String> {
-    let raw = query
-        .to_lowercase()
+    let raw = fold_for_match(query)
         .split(is_query_separator)
         .filter(|token| token.chars().count() > 1)
         .filter(|token| !is_stop_word(token))
@@ -935,10 +1200,82 @@ fn is_query_separator(c: char) -> bool {
         )
 }
 
+/// Function words that carry no retrieval signal.
+///
+/// Entries are written **unaccented** on purpose: callers fold before testing,
+/// so `qué`/`que` and `cuándo`/`cuando` are both covered by one entry.
+///
+/// The interrogative and auxiliary sets (`who`, `which`, `where`, `can`,
+/// `quien`, `cual`, `donde`, …) were added for F-3: without them a question
+/// like "Who is defendant counsel?" scored no phrase at all, and the asserting
+/// page lost the candidate set to pages with more bulk text.
 fn is_stop_word(token: &str) -> bool {
     matches!(
         token,
-        "的" | "是"
+        // Interrogatives and auxiliaries (English)
+        "who" | "whom"
+            | "whose"
+            | "which"
+            | "when"
+            | "where"
+            | "why"
+            | "whether"
+            | "can"
+            | "could"
+            | "should"
+            | "would"
+            | "will"
+            | "shall"
+            | "may"
+            | "might"
+            | "must"
+            | "am"
+            // Interrogatives and function words (Spanish; written unaccented)
+            | "quien"
+            | "quienes"
+            | "que"
+            | "cual"
+            | "cuales"
+            | "cuando"
+            | "donde"
+            | "adonde"
+            | "como"
+            | "cuanto"
+            | "cuantos"
+            | "cuanta"
+            | "cuantas"
+            | "el"
+            | "la"
+            | "lo"
+            | "los"
+            | "las"
+            | "un"
+            | "una"
+            | "unos"
+            | "unas"
+            | "del"
+            | "de"
+            | "en"
+            | "por"
+            | "para"
+            | "con"
+            | "es"
+            | "son"
+            | "era"
+            | "fue"
+            | "esta"
+            | "este"
+            | "esto"
+            | "estos"
+            | "estas"
+            | "se"
+            | "su"
+            | "sus"
+            | "al"
+            | "ha"
+            | "han"
+        | "的"
+            | "是"
             | "了"
             | "什么"
             | "在"
@@ -986,11 +1323,12 @@ fn trim_query_punctuation(value: &str) -> String {
     value.trim_matches(is_query_separator).to_string()
 }
 
-fn token_match_score(text: &str, tokens: &[String]) -> usize {
-    let lower = text.to_lowercase();
+/// Count how many query tokens appear in `folded_text`. The caller folds; this
+/// must not fold again or the two sides could disagree about what was compared.
+fn token_match_score(folded_text: &str, tokens: &[String]) -> usize {
     tokens
         .iter()
-        .filter(|token| lower.contains(token.as_str()))
+        .filter(|token| folded_text.contains(token.as_str()))
         .count()
 }
 
@@ -1597,35 +1935,196 @@ fn doubao_multimodal_embedding_body(model: &str, text: &str) -> Value {
     })
 }
 
+/// The YAML frontmatter block's inner text, if the page opens with one.
+///
+/// An unterminated block yields `None`: a malformed page is treated as all
+/// body, which is the safe direction — we would rather show YAML than show
+/// nothing.
+fn frontmatter_span(content: &str) -> Option<(usize, usize, usize)> {
+    let after_fence = if content.starts_with("---\n") {
+        4
+    } else if content.starts_with("---\r\n") {
+        5
+    } else {
+        return None;
+    };
+    let mut cursor = after_fence;
+    for line in content[after_fence..].split_inclusive('\n') {
+        if line.trim_end() == "---" {
+            return Some((after_fence, cursor, cursor + line.len()));
+        }
+        cursor += line.len();
+    }
+    None
+}
+
+fn frontmatter_block(content: &str) -> Option<&str> {
+    frontmatter_span(content).map(|(start, end, _)| &content[start..end])
+}
+
+/// Byte offset of the first character of the page body — i.e. past any leading
+/// YAML frontmatter. `0` when the page has none.
+fn body_offset(content: &str) -> usize {
+    frontmatter_span(content)
+        .map(|(_, _, body)| body.min(content.len()))
+        .unwrap_or(0)
+}
+
+/// First index at or after `from` where `needle` occurs in `haystack`.
+/// Char-slice search, because snippet offsets must be char-indexed (see
+/// [`build_snippet_from_anchors`]).
+fn find_chars(haystack: &[char], needle: &[char], from: usize) -> Option<usize> {
+    if needle.is_empty() || from >= haystack.len() || needle.len() > haystack.len() - from {
+        return None;
+    }
+    (from..=haystack.len() - needle.len())
+        .find(|start| &haystack[*start..start + needle.len()] == needle)
+}
+
+/// Byte offset of the first `##`-or-deeper heading in the body.
+///
+/// Everything above it is the H1 title and any preamble — text that repeats the
+/// page's identifiers and asserts nothing. A match inside a titled section is
+/// preferred over one there, which is what "the first substantive section"
+/// means for these pages.
+fn first_section_offset(content: &str, body_start: usize) -> Option<usize> {
+    let mut cursor = body_start;
+    for line in content[body_start..].split_inclusive('\n') {
+        if line.trim_start().starts_with("##") {
+            return Some(cursor);
+        }
+        cursor += line.len();
+    }
+    None
+}
+
+/// The nearest Markdown heading at or above `offset`, for labelling a snippet
+/// with the section it came from. Mirrors the `heading: text` shape that vector
+/// snippets already use, so both retrieval paths read the same.
+fn enclosing_heading(content: &str, offset: usize) -> Option<String> {
+    let mut heading = None;
+    let mut cursor = 0usize;
+    for line in content.split_inclusive('\n') {
+        if cursor > offset {
+            break;
+        }
+        let trimmed = line.trim();
+        if trimmed.starts_with('#') {
+            let text = trimmed.trim_start_matches('#').trim();
+            if !text.is_empty() {
+                heading = Some(text.to_string());
+            }
+        }
+        cursor += line.len();
+    }
+    heading
+}
+
 pub fn build_snippet(content: &str, query: &str) -> String {
-    let lower = content.to_lowercase();
-    let q = query.to_lowercase();
-    let idx = lower.find(&q).unwrap_or(0);
+    build_snippet_from_anchors(content, std::slice::from_ref(&query))
+}
+
+/// Pick the excerpt window.
+///
+/// Two rules, both from F-5 (`12_QA/e2e_results_2026-07-28.md`): every mirrored
+/// page opens with a YAML block whose `aliases` are engineered to match, so the
+/// first token hit almost always lands in the frontmatter and the window closes
+/// before the section that actually asserts the fact.
+///
+/// 1. Anchors are sought in the **body only**, and the window is clamped so it
+///    can never open inside the frontmatter.
+/// 2. When no anchor occurs in the body, the window opens at the start of the
+///    body rather than at byte 0 — substance beats YAML even with no match.
+///
+/// Frontmatter-only pages fall back to the whole content so they still yield
+/// something.
+pub fn build_snippet_from_anchors(content: &str, anchors: &[&str]) -> String {
     let char_positions: Vec<usize> = content.char_indices().map(|(idx, _)| idx).collect();
     if char_positions.is_empty() {
         return String::new();
     }
-    let match_char = char_positions
-        .iter()
-        .position(|byte| *byte >= idx)
-        .unwrap_or(char_positions.len().saturating_sub(1));
-    let query_chars = query.chars().count().max(1);
-    let start_char = match_char.saturating_sub(SNIPPET_CONTEXT);
-    let end_char = (match_char + query_chars + SNIPPET_CONTEXT).min(char_positions.len());
+    let last_char = char_positions.len() - 1;
+    // Matching happens in *char* space. Folding is 1:1 by char but not by byte
+    // (`é` is two bytes, `e` is one), so a byte offset into the folded text
+    // would not address the same place in the source once a page carries any
+    // accent — which every page in this corpus does.
+    let folded: Vec<char> = content.chars().map(fold_char).collect();
+    let byte_to_char = |byte: usize| {
+        char_positions
+            .iter()
+            .position(|candidate| *candidate >= byte)
+            .unwrap_or(last_char)
+    };
+
+    let body_byte = body_offset(content);
+    // A page that is nothing but frontmatter still has to return an excerpt.
+    let body_byte = if content[body_byte..].trim().is_empty() {
+        0
+    } else {
+        body_byte
+    };
+    let body_start_char = byte_to_char(body_byte);
+
+    let first_section_char = first_section_offset(content, body_byte).map(byte_to_char);
+
+    // Two passes. The first only considers matches inside a titled section, so
+    // "## What it proves" wins over the H1 line that merely repeats the docid.
+    // The second falls back to anywhere in the body.
+    let mut search_starts = Vec::with_capacity(2);
+    if let Some(section) = first_section_char {
+        search_starts.push(section);
+    }
+    search_starts.push(body_start_char);
+
+    // Within a pass, anchors are tried in priority order, not merged: the
+    // caller passes the matched phrase first, then single tokens. Taking the
+    // earliest match across all of them would let a common token outrank the
+    // phrase that actually explains why the page ranked.
+    let match_idx = search_starts.into_iter().find_map(|from| {
+        anchors
+            .iter()
+            .filter(|anchor| !anchor.trim().is_empty())
+            .find_map(|anchor| {
+                let needle: Vec<char> = anchor.chars().map(fold_char).collect();
+                find_chars(&folded, &needle, from).map(|found| (found, needle.len()))
+            })
+    });
+    let (match_char, anchor_chars) = match_idx.unwrap_or((body_start_char, 1));
+
+    // A match above the first titled section is in the H1 or preamble — text
+    // that restates the page's own identifiers. Spend the whole window forward
+    // from it, because whatever asserts the fact is below, not above. Matches
+    // inside a section (and pages with no sections) keep the centred window.
+    let matched_in_preamble = first_section_char.is_some_and(|section| match_char < section);
+    let (lead, trail) = if matched_in_preamble {
+        (0, SNIPPET_CONTEXT * 2)
+    } else {
+        (SNIPPET_CONTEXT, SNIPPET_CONTEXT)
+    };
+    let start_char = match_char
+        .saturating_sub(lead)
+        .max(body_start_char)
+        .min(last_char);
+    let end_char = (match_char + anchor_chars.max(1) + trail).min(char_positions.len());
     let start = char_positions[start_char];
     let end = if end_char < char_positions.len() {
         char_positions[end_char]
     } else {
         content.len()
     };
-    let mut snippet = content[start..end].replace('\n', " ");
+    let mut snippet = content[start..end.max(start)].replace('\n', " ");
     if start > 0 {
         snippet = format!("...{snippet}");
     }
     if end < content.len() {
         snippet.push_str("...");
     }
-    snippet
+    // Name the section when the window does not already contain its heading,
+    // so "What it proves" is legible even on a mid-section window.
+    match enclosing_heading(content, start) {
+        Some(heading) if !snippet.contains(heading.as_str()) => format!("{heading}: {snippet}"),
+        _ => snippet,
+    }
 }
 
 fn normalize_path(path: &str) -> String {
@@ -2027,6 +2526,7 @@ mod tests {
             20,
             false,
             None,
+            Vec::new(),
         )
         .await
         .unwrap();
@@ -2063,6 +2563,7 @@ mod tests {
             10,
             false,
             None,
+            Vec::new(),
         )
         .await
         .unwrap();
@@ -2182,6 +2683,7 @@ mod tests {
             20,
             false,
             None,
+            Vec::new(),
         )
         .await
         .unwrap();
@@ -2211,6 +2713,7 @@ mod tests {
             20,
             false,
             None,
+            Vec::new(),
         )
         .await
         .unwrap();
@@ -2241,5 +2744,554 @@ mod tests {
         assert!(parse_embedding_batch_values(&response, 2)
             .unwrap_err()
             .contains("duplicate"));
+    }
+
+    // ---------------------------------------------------------------------
+    // Regressions for the retrieval defects recorded in bella-casefile
+    // `12_QA/e2e_results_2026-07-28.md` (SARAH-E2E-RUN, Surface A NO-GO):
+    // F-5 frontmatter-led snippets, F-3 question-hostile ranking,
+    // F-7 diacritic-sensitive matching, and silent mode degradation.
+    // ---------------------------------------------------------------------
+
+    /// The EVD-0019 page shape from F-5: a YAML head whose aliases are
+    /// engineered to match, then the section that actually asserts the fact.
+    const FRONTMATTER_LED_PAGE: &str = "---\n\
+type: \"document\"\n\
+docid: \"EVD-0019\"\n\
+privilege: \"Public\"\n\
+production: \"producible (Public)\"\n\
+category: \"Evidence\"\n\
+source: \"01_Catalog/master_catalog.csv:56\"\n\
+aliases:\n  \
+- \"EVD-0019\"\n  \
+- \"Chapel Royal title\"\n\
+---\n\
+\n\
+# EVD-0019 — HM Land Registry Chapel Royal ESX146745 OFFICIAL COPY\n\
+\n\
+## What it proves\n\
+\n\
+Certified Chapel Royal title — UPGRADES EVD-0008 from G2 to G1.\n";
+
+    fn write_counsel_corpus(root: &Path) {
+        // The asserting page. Carries the literal frontmatter alias
+        // "defendant counsel" but almost no bulk text.
+        write_page(
+            root,
+            "wiki/people/arnoldo-acuna-alvarado.md",
+            "---\n\
+type: \"person\"\n\
+group: \"Counsel & experts\"\n\
+source: \"04_People/cast_of_characters.md:28\"\n\
+aliases:\n  \
+- \"Arnoldo Acuña Alvarado\"\n  \
+- \"defendant counsel\"\n  \
+- \"defense counsel\"\n\
+---\n\
+\n\
+# Lic. Arnoldo Esteban Acuña Alvarado\n\
+\n\
+## Key facts\n\
+\n\
+Marcus's sole counsel of record.\n",
+        );
+        // The work-product page that displaced it in the QA run: no alias, but
+        // far more textual matches on the common word.
+        write_page(
+            root,
+            "wiki/documents/WP-0005.md",
+            "---\n\
+type: \"document\"\n\
+docid: \"WP-0005\"\n\
+privilege: \"WorkProduct\"\n\
+production: \"EXCLUDED — DO NOT PRODUCE\"\n\
+---\n\
+\n\
+# WP-0005 — Strategy chats\n\
+\n\
+## Summary\n\
+\n\
+Strategy chats with counsel. Counsel and investigators reviewed counsel notes.\n\
+Counsel, counsel, counsel, counsel, counsel in this case.\n",
+        );
+        // Bulk-text decoys. Each carries every content word of the question
+        // form ("who", "defendant", "counsel") and so outscores the asserting
+        // page once the alias stops carrying — which is how a page that is
+        // indexed and highly rankable leaves the window entirely.
+        for index in 1..=10 {
+            write_page(
+                root,
+                &format!("wiki/documents/TRN-{index:04}.md"),
+                &format!(
+                    "---\n\
+type: \"document\"\n\
+docid: \"TRN-{index:04}\"\n\
+privilege: \"WorkProduct\"\n\
+production: \"EXCLUDED — DO NOT PRODUCE\"\n\
+---\n\
+\n\
+# TRN-{index:04} — Transcript\n\
+\n\
+## Summary\n\
+\n\
+Notes on who attended, which counsel spoke for the defendant, and what the \
+defendant's counsel said in this case.\n"
+                ),
+            );
+        }
+    }
+
+    fn rank_of(out: &ProjectSearchResponse, path: &str) -> Option<usize> {
+        out.results
+            .iter()
+            .position(|result| normalize_path(&result.path) == path)
+            .map(|index| index + 1)
+    }
+
+    // --- Task 1 / F-5 -----------------------------------------------------
+
+    #[test]
+    fn frontmatter_span_handles_absent_and_unterminated_blocks() {
+        assert_eq!(body_offset("# No frontmatter\n\nbody"), 0);
+        // An unterminated block must not swallow the whole page.
+        assert_eq!(body_offset("---\ntype: \"document\"\nstill open"), 0);
+        let closed = "---\ntitle: X\n---\nbody";
+        assert_eq!(&closed[body_offset(closed)..], "body");
+        let crlf = "---\r\ntitle: X\r\n---\r\nbody";
+        assert_eq!(&crlf[body_offset(crlf)..], "body");
+    }
+
+    #[test]
+    fn snippet_skips_frontmatter_and_returns_the_asserting_section() {
+        // "EVD-0019" occurs first inside the YAML head. Before the fix the
+        // window opened there and closed before "## What it proves".
+        let snippet = build_snippet(FRONTMATTER_LED_PAGE, "EVD-0019");
+
+        assert!(
+            snippet.contains("Certified Chapel Royal title"),
+            "snippet must carry the asserting sentence, got: {snippet}"
+        );
+        assert!(
+            snippet.contains("UPGRADES EVD-0008 from G2 to G1"),
+            "snippet must carry the G2 to G1 upgrade, got: {snippet}"
+        );
+        assert!(
+            !snippet.contains("privilege:"),
+            "snippet must not open on the YAML head, got: {snippet}"
+        );
+        assert!(
+            !snippet.contains("aliases:"),
+            "snippet must not open on the YAML head, got: {snippet}"
+        );
+    }
+
+    #[test]
+    fn snippet_prefers_a_titled_section_over_the_h1_preamble() {
+        // The anchor occurs twice: once in the preamble, once in a titled
+        // section, far enough apart that one window cannot contain both.
+        let page = "---\ntitle: Alpha\n---\n\n\
+# Alpha identifier\n\n\
+Routing preamble that exists only to restate the identifier and to push the \
+asserting section past the end of any window opened on the preamble copy of \
+the anchor, which is exactly the shape that made Q2 fail.\n\n\
+## Key facts\n\n\
+Alpha is asserted here with the controlling fact.\n";
+
+        let snippet = build_snippet_from_anchors(page, &["alpha"]);
+
+        assert!(
+            snippet.contains("asserted here with the controlling fact"),
+            "expected the titled section, got: {snippet}"
+        );
+        assert!(
+            !snippet.contains("Routing preamble"),
+            "window should not have opened on the preamble, got: {snippet}"
+        );
+    }
+
+    #[test]
+    fn snippet_offsets_survive_accents_before_the_match() {
+        // Folding is 1:1 by char but not by byte, so every accent ahead of the
+        // anchor drifts a byte-indexed window further right. Enough of them and
+        // the window slides clean past the fact it was supposed to frame.
+        let mut page = String::from("---\ntitle: Expediente\n---\n\n# Página\n\n## Datos\n\n");
+        page.push_str(&"áéíóúñ ".repeat(40));
+        page.push_str("la cédula 9-0110-0855 consta aquí.\n\n");
+        page.push_str(&"filler text that is plain ascii. ".repeat(15));
+
+        let snippet = build_snippet_from_anchors(&page, &["9-0110-0855"]);
+
+        assert!(
+            snippet.contains("9-0110-0855"),
+            "window drifted off the anchor, got: {snippet}"
+        );
+    }
+
+    #[test]
+    fn snippet_falls_back_to_the_body_not_the_yaml_when_nothing_matches() {
+        let snippet = build_snippet(FRONTMATTER_LED_PAGE, "term-that-is-absent");
+        assert!(
+            !snippet.contains("privilege:"),
+            "a no-match page must still return body text, got: {snippet}"
+        );
+        assert!(
+            snippet.contains("HM Land Registry"),
+            "expected the body head, got: {snippet}"
+        );
+    }
+
+    #[test]
+    fn snippet_uses_the_whole_page_when_there_is_no_body() {
+        let only_frontmatter = "---\ntype: \"document\"\ndocid: \"EVD-0019\"\n---\n";
+        let snippet = build_snippet(only_frontmatter, "EVD-0019");
+        assert!(
+            snippet.contains("EVD-0019"),
+            "a frontmatter-only page must still yield an excerpt, got: {snippet}"
+        );
+    }
+
+    #[tokio::test]
+    async fn search_returns_the_asserting_section_for_a_frontmatter_led_page() {
+        let root = tmp_project();
+        write_page(&root, "wiki/documents/EVD-0019.md", FRONTMATTER_LED_PAGE);
+
+        let out = search_project_inner(
+            root.to_string_lossy().to_string(),
+            "What does EVD-0019 prove?".into(),
+            20,
+            false,
+            None,
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+
+        let snippet = &out.results[0].snippet;
+        assert!(
+            snippet.contains("Certified Chapel Royal title"),
+            "got: {snippet}"
+        );
+        assert!(!snippet.contains("privilege:"), "got: {snippet}");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    // --- Task 2 / F-3 -----------------------------------------------------
+
+    #[test]
+    fn content_phrases_survive_interrogative_wrappers() {
+        // All three question forms reduce to the same content phrase as the
+        // bare keyword query, which is what restores the phrase bonus.
+        assert_eq!(
+            content_phrases("Who is defendant counsel?"),
+            vec!["defendant counsel".to_string()]
+        );
+        assert_eq!(
+            content_phrases("Who is the defendant counsel in this case?"),
+            vec!["defendant counsel".to_string()]
+        );
+        assert_eq!(
+            content_phrases("Who is Marcus's sole counsel of record?"),
+            vec!["sole counsel".to_string()]
+        );
+        // A stop word breaks a run rather than being spliced out, so words that
+        // were not adjacent never form a phrase — and a run of one is not one.
+        assert!(content_phrases("counsel of record").is_empty());
+    }
+
+    #[test]
+    fn frontmatter_aliases_parse_block_and_inline_forms() {
+        let block = "---\naliases:\n  - \"defendant counsel\"\n  - \"defense counsel\"\n---\nbody";
+        assert_eq!(
+            frontmatter_aliases(block),
+            vec![
+                "defendant counsel".to_string(),
+                "defense counsel".to_string()
+            ]
+        );
+        let inline = "---\naliases: [\"cédula 9-0110-0855\", \"Verónica Pierce\"]\n---\nbody";
+        // Aliases are folded, so an unaccented query reaches them too.
+        assert_eq!(
+            frontmatter_aliases(inline),
+            vec![
+                "cedula 9-0110-0855".to_string(),
+                "veronica pierce".to_string()
+            ]
+        );
+        assert!(frontmatter_aliases("# No frontmatter").is_empty());
+    }
+
+    #[tokio::test]
+    async fn question_form_keeps_the_alias_page_in_the_candidate_set() {
+        let root = tmp_project();
+        write_counsel_corpus(&root);
+        const COUNSEL: &str = "wiki/people/arnoldo-acuna-alvarado.md";
+
+        // Every phrasing recorded in the F-3 table, with the rank bound the
+        // report itself justifies. The three interrogative forms are the ones
+        // that were ABSENT from all candidates; the bare single token ranked
+        // 3rd even in the passing run, so presence is its bar — F-3's claim is
+        // that question form must not remove the page, not that a one-word
+        // query must rank it first.
+        // topK 8, as the QA run used, so "fell out of the window" is a real
+        // failure mode here and not an artifact of an oversized window.
+        for (probe, worst_acceptable_rank) in [
+            ("Arnoldo Acuña Alvarado", 1),
+            ("defendant counsel", 1),
+            ("counsel", 8),
+            ("Who is defendant counsel?", 1),
+            ("Who is the defendant counsel in this case?", 1),
+            ("Who is Marcus's sole counsel of record?", 1),
+        ] {
+            let out = search_project_inner(
+                root.to_string_lossy().to_string(),
+                probe.into(),
+                8,
+                false,
+                None,
+                Vec::new(),
+            )
+            .await
+            .unwrap();
+
+            let rank = rank_of(&out, COUNSEL);
+            let listed = out
+                .results
+                .iter()
+                .map(|result| result.path.clone())
+                .collect::<Vec<_>>();
+            assert!(
+                rank.is_some_and(|rank| rank <= worst_acceptable_rank),
+                "probe {probe:?} expected the counsel page at rank <= {worst_acceptable_rank}, \
+                 got {rank:?}; candidates: {listed:?}"
+            );
+        }
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn unaccented_question_still_reaches_the_alias_page() {
+        // F-3 and F-7 compounded: question form *and* a stripped accent.
+        let root = tmp_project();
+        write_counsel_corpus(&root);
+
+        let out = search_project_inner(
+            root.to_string_lossy().to_string(),
+            "Who is Arnoldo Acuna Alvarado?".into(),
+            25,
+            false,
+            None,
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            rank_of(&out, "wiki/people/arnoldo-acuna-alvarado.md"),
+            Some(1)
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    // --- Task 3 / F-7 -----------------------------------------------------
+
+    #[test]
+    fn folding_is_one_to_one_and_symmetric() {
+        assert_eq!(fold_for_match("Cédula"), "cedula");
+        assert_eq!(fold_for_match("PENSIÓN"), "pension");
+        assert_eq!(fold_for_match("Dictámen"), "dictamen");
+        assert_eq!(fold_for_match("Verónica Sáenz Monge"), "veronica saenz monge");
+        assert_eq!(fold_for_match("niño"), "nino");
+        // Folding an already-folded string is a no-op, so callers may fold
+        // defensively without changing the result.
+        assert_eq!(fold_for_match("cedula"), "cedula");
+        // Char count is preserved — snippet offsets depend on it.
+        for sample in ["cédula", "pensión", "dictámen", "默会知识", "Ünïcödé"] {
+            assert_eq!(
+                fold_for_match(sample).chars().count(),
+                sample.chars().count(),
+                "fold must be 1:1 for {sample:?}"
+            );
+        }
+        // Expanding folds are deliberately not applied.
+        assert_eq!(fold_for_match("straße"), "straße");
+    }
+
+    #[tokio::test]
+    async fn diacritic_folding_matches_both_directions() {
+        let root = tmp_project();
+        // Each term exists in exactly ONE spelling, and the filenames are
+        // deliberately neutral: a filename carrying the unaccented form would
+        // satisfy the query by itself and hide the defect. `cédula` and
+        // `pensión` are accented-only; `dictamen` is unaccented-only, so both
+        // directions of the fold are under test.
+        write_page(
+            &root,
+            "wiki/glossary/termino-01.md",
+            "---\ntitle: Cédula\n---\n\n# Cédula\n\n## Key facts\n\nLa cédula 9-0110-0855 identifica a la actora.\n",
+        );
+        write_page(
+            &root,
+            "wiki/glossary/termino-02.md",
+            "---\ntitle: Pensión alimentaria\n---\n\n# Pensión\n\n## Key facts\n\nLa pensión alimentaria se fija por el juzgado.\n",
+        );
+        write_page(
+            &root,
+            "wiki/glossary/termino-03.md",
+            "---\ntitle: Dictamen pericial\n---\n\n# Dictamen\n\n## Key facts\n\nEl dictamen pericial consta en el expediente.\n",
+        );
+
+        for (query, expected) in [
+            ("cedula", "wiki/glossary/termino-01.md"),
+            ("cédula", "wiki/glossary/termino-01.md"),
+            ("pension", "wiki/glossary/termino-02.md"),
+            ("pensión", "wiki/glossary/termino-02.md"),
+            ("dictamen", "wiki/glossary/termino-03.md"),
+            ("dictámen", "wiki/glossary/termino-03.md"),
+        ] {
+            let out = search_project_inner(
+                root.to_string_lossy().to_string(),
+                query.into(),
+                20,
+                false,
+                None,
+                Vec::new(),
+            )
+            .await
+            .unwrap();
+
+            assert!(
+                !out.results.is_empty(),
+                "query {query:?} returned nothing; before the fix the unaccented form returned 0 results"
+            );
+            assert_eq!(
+                rank_of(&out, expected),
+                Some(1),
+                "query {query:?} should rank {expected} first"
+            );
+            assert!(
+                out.token_hits > 0,
+                "query {query:?} should register token hits"
+            );
+        }
+        let _ = fs::remove_dir_all(root);
+    }
+
+    // --- Task 4 / mode degradation ---------------------------------------
+
+    #[tokio::test]
+    async fn a_clean_keyword_run_reports_no_degradation() {
+        let root = tmp_project();
+        write_page(
+            &root,
+            "wiki/concepts/attention.md",
+            "---\ntitle: Attention\n---\n\n# Attention\n\n## Key facts\n\nAttention is all you need.\n",
+        );
+
+        let out = search_project_inner(
+            root.to_string_lossy().to_string(),
+            "attention".into(),
+            20,
+            false,
+            None,
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(out.mode, "keyword");
+        assert_eq!(out.requested_mode, None);
+        assert!(out.degradations.is_empty());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn embedding_failure_is_reported_in_the_response_not_only_stderr() {
+        let root = tmp_project();
+        write_page(
+            &root,
+            "wiki/concepts/attention.md",
+            "---\ntitle: Attention\n---\n\n# Attention\n\n## Key facts\n\nAttention is all you need.\n",
+        );
+
+        let out = search_project_inner(
+            root.to_string_lossy().to_string(),
+            "attention".into(),
+            20,
+            false,
+            None,
+            vec![SearchDegradation {
+                stage: "embedding".to_string(),
+                from: "hybrid".to_string(),
+                to: "keyword".to_string(),
+                reason: "query embedding unavailable: connection refused".to_string(),
+            }],
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(out.mode, "keyword");
+        assert_eq!(out.requested_mode.as_deref(), Some("hybrid"));
+        assert_eq!(out.degradations.len(), 1);
+        assert_eq!(out.degradations[0].stage, "embedding");
+        assert!(out.degradations[0].reason.contains("connection refused"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn resolve_query_embedding_records_why_it_gave_up() {
+        // An enabled config pointing at a dead endpoint used to return
+        // Ok(None) with nothing but an eprintln to show for it.
+        let cfg = SearchEmbeddingConfig {
+            enabled: true,
+            endpoint: "http://127.0.0.1:1/v1/embeddings".to_string(),
+            api_key: String::new(),
+            model: "test-embed".to_string(),
+            output_dimensionality: None,
+            extra_headers: None,
+        };
+
+        let outcome = resolve_query_embedding("cedula", None, Some(cfg))
+            .await
+            .unwrap();
+
+        assert!(outcome.embedding.is_none());
+        assert_eq!(outcome.degradations.len(), 1);
+        assert_eq!(outcome.degradations[0].stage, "embedding");
+        assert_eq!(outcome.degradations[0].to, "keyword");
+    }
+
+    #[tokio::test]
+    async fn a_disabled_embedding_config_is_not_a_degradation() {
+        // Never configured is not the same as configured and broken.
+        let cfg = SearchEmbeddingConfig {
+            enabled: false,
+            endpoint: String::new(),
+            api_key: String::new(),
+            model: String::new(),
+            output_dimensionality: None,
+            extra_headers: None,
+        };
+
+        let outcome = resolve_query_embedding("cedula", None, Some(cfg))
+            .await
+            .unwrap();
+
+        assert!(outcome.embedding.is_none());
+        assert!(outcome.degradations.is_empty());
+    }
+
+    #[test]
+    fn degradation_suffix_is_silent_unless_something_degraded() {
+        assert_eq!(degradation_suffix(None, &[]), "");
+        let degradations = vec![SearchDegradation {
+            stage: "vectorIndex".to_string(),
+            from: "hybrid".to_string(),
+            to: "keyword".to_string(),
+            reason: "vector index returned no chunks".to_string(),
+        }];
+        let suffix = degradation_suffix(Some("hybrid"), &degradations);
+        assert!(suffix.contains("DEGRADED from hybrid"));
+        assert!(suffix.contains("vectorIndex"));
+        assert!(suffix.contains("no chunks"));
     }
 }

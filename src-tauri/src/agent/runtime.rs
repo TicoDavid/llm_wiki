@@ -675,12 +675,16 @@ impl AgentRuntime {
                             tool: "wiki.search".to_string(),
                             status: "completed".to_string(),
                             detail: Some(format!(
-                                "{} result(s), mode={}, tokenHits={}, vectorHits={}, graphHits={}",
+                                "{} result(s), mode={}, tokenHits={}, vectorHits={}, graphHits={}{}",
                                 search_count,
                                 search.mode,
                                 search.token_hits,
                                 search.vector_hits,
-                                search.graph_hits
+                                search.graph_hits,
+                                crate::commands::search::degradation_suffix(
+                                    search.requested_mode.as_deref(),
+                                    &search.degradations,
+                                )
                             )),
                         },
                     );
@@ -2256,8 +2260,15 @@ impl AgentRuntime {
                     })
                     .count();
                 Ok(format!(
-                    "{count} result(s), {added} new, mode={}, tokenHits={}, vectorHits={}, graphHits={}",
-                    search.mode, search.token_hits, search.vector_hits, search.graph_hits
+                    "{count} result(s), {added} new, mode={}, tokenHits={}, vectorHits={}, graphHits={}{}",
+                    search.mode,
+                    search.token_hits,
+                    search.vector_hits,
+                    search.graph_hits,
+                    crate::commands::search::degradation_suffix(
+                        search.requested_mode.as_deref(),
+                        &search.degradations,
+                    )
                 ))
             }
             "source.search" | "graph.search" | "web.search" | "anytxt.search" => {

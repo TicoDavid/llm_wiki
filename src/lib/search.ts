@@ -17,6 +17,15 @@ export interface SearchResult {
   images: ImageRef[]
 }
 
+/** One recorded step-down from the retrieval mode the request asked for. */
+export interface SearchDegradation {
+  /** `embedding` | `vectorSearch` | `vectorIndex` */
+  stage: string
+  from: string
+  to: string
+  reason: string
+}
+
 interface BackendSearchResponse {
   // Reserved for result badges/debug UI. The backend already returns these
   // signals so API and WebView search share the same retrieval contract.
@@ -25,6 +34,13 @@ interface BackendSearchResponse {
   tokenHits: number
   vectorHits: number
   graphHits?: number
+  /**
+   * Present only when the served `mode` is not the one that was requested;
+   * `degradations` then says why. Both are optional so responses produced
+   * before this contract existed still parse.
+   */
+  requestedMode?: string | null
+  degradations?: SearchDegradation[]
 }
 
 const STOP_WORDS = new Set([

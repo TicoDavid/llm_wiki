@@ -19,7 +19,7 @@ use tokio::time::{timeout, Duration};
 use walkdir::WalkDir;
 
 use crate::commands::external_search::file_url_for_path;
-use crate::commands::search::{self, SearchEmbeddingConfig};
+use crate::commands::search::{self, SearchDegradation, SearchEmbeddingConfig};
 
 use super::types::{AgentKnowledgeContext, AgentReference, AgentVersionSummary};
 use super::workspace::{agent_workspace_path, AGENT_WORKSPACE_DIR};
@@ -290,6 +290,11 @@ pub struct WikiSearchToolOutput {
     pub token_hits: usize,
     pub vector_hits: usize,
     pub graph_hits: usize,
+    /// Set only when the served `mode` is not the one the request asked for.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requested_mode: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub degradations: Vec<SearchDegradation>,
     pub references: Vec<AgentReference>,
 }
 
@@ -828,13 +833,14 @@ pub async fn run_wiki_search(
     include_content: bool,
     embedding_config: Option<SearchEmbeddingConfig>,
 ) -> Result<WikiSearchToolOutput, String> {
-    let query_embedding = search::resolve_query_embedding(query, None, embedding_config).await?;
+    let embedding_outcome = search::resolve_query_embedding(query, None, embedding_config).await?;
     let search = search::search_project_inner(
         project_path.clone(),
         query.to_string(),
         top_k,
         include_content,
-        query_embedding,
+        embedding_outcome.embedding,
+        embedding_outcome.degradations,
     )
     .await?;
     let project_for_context = project_path.clone();
@@ -874,6 +880,8 @@ pub async fn run_wiki_search(
         token_hits: search.token_hits,
         vector_hits: search.vector_hits,
         graph_hits: search.graph_hits,
+        requested_mode: search.requested_mode,
+        degradations: search.degradations,
         references,
     })
 }
