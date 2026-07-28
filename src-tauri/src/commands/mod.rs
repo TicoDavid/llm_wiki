@@ -1,5 +1,5 @@
 pub mod claude_cli;
-mod cli_resolver;
+pub(crate) mod cli_resolver;
 pub mod codex_cli;
 pub mod ebook;
 pub mod external_search;
