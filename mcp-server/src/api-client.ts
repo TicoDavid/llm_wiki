@@ -30,11 +30,21 @@ export interface ApiSearchResult {
   vectorScore?: number | null
 }
 
+export interface ApiSearchDegradation {
+  stage: string
+  from: string
+  to: string
+  reason: string
+}
+
 export interface ApiSearchResponse {
   results: ApiSearchResult[]
   mode?: string
   tokenHits?: number
   vectorHits?: number
+  /** Set only when `mode` is not the mode the request asked for. */
+  requestedMode?: string
+  degradations?: ApiSearchDegradation[]
 }
 
 export interface ApiChatReference {
@@ -230,6 +240,10 @@ export class LlmWikiApiClient {
       mode: typeof json.mode === "string" ? json.mode : undefined,
       tokenHits: numberOrUndefined(json.tokenHits),
       vectorHits: numberOrUndefined(json.vectorHits),
+      requestedMode: typeof json.requestedMode === "string" ? json.requestedMode : undefined,
+      degradations: Array.isArray(json.degradations)
+        ? json.degradations.map(parseSearchDegradation)
+        : undefined,
     }
   }
 
@@ -349,6 +363,16 @@ function parseFileNode(value: unknown): ApiFileNode {
     path: String(obj.path ?? ""),
     isDir: obj.isDir === true || obj.is_dir === true,
     ...(children ? { children } : {}),
+  }
+}
+
+function parseSearchDegradation(value: unknown): ApiSearchDegradation {
+  const obj = requireObject(value, "search degradation")
+  return {
+    stage: String(obj.stage ?? ""),
+    from: String(obj.from ?? ""),
+    to: String(obj.to ?? ""),
+    reason: String(obj.reason ?? ""),
   }
 }
 

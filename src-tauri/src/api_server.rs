@@ -1649,13 +1649,13 @@ fn handle_search(app: &AppHandle, project_id: &str, body: &str) -> ApiResponse {
     }
     let top_k = req.top_k.unwrap_or(10).clamp(1, MAX_SEARCH_RESULTS);
     let query = req.query;
-    let query_embedding =
+    let embedding_outcome =
         match tauri::async_runtime::block_on(commands::search::resolve_query_embedding(
             &query,
             req.query_embedding,
             load_embedding_config(app),
         )) {
-            Ok(embedding) => embedding,
+            Ok(outcome) => outcome,
             Err(e) => return err(400, e),
         };
     match tauri::async_runtime::block_on(commands::search::search_project_inner(
@@ -1663,8 +1663,13 @@ fn handle_search(app: &AppHandle, project_id: &str, body: &str) -> ApiResponse {
         query,
         top_k,
         req.include_content.unwrap_or(false),
-        query_embedding,
+        embedding_outcome.embedding,
+        embedding_outcome.degradations,
     )) {
+        // `requestedMode` and `degradations` are additive: every pre-existing
+        // key keeps its name, type and meaning. They are always present rather
+        // than conditional so that "no degradation" is stated explicitly
+        // (`null` / `[]`) instead of being inferred from a missing key.
         Ok(search) => ok(json!({
             "ok": true,
             "projectId": project.id,
@@ -1673,6 +1678,8 @@ fn handle_search(app: &AppHandle, project_id: &str, body: &str) -> ApiResponse {
             "tokenHits": search.token_hits,
             "vectorHits": search.vector_hits,
             "graphHits": search.graph_hits,
+            "requestedMode": search.requested_mode,
+            "degradations": search.degradations,
             "results": search.results,
         })),
         Err(e) => err(500, e),
