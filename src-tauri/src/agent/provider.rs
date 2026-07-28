@@ -56,6 +56,11 @@ pub struct LlmConfig {
     /// Missing keeps the historical streaming behavior for existing configs.
     #[serde(default)]
     pub streaming_enabled: Option<bool>,
+    /// CLI-transport providers only. Mirrors `localCliIsolation` in the
+    /// frontend config so a subprocess spawned by the backend Agent honours
+    /// the same MCP/tools/session constraints the desktop UI applies.
+    #[serde(default)]
+    pub local_cli_isolation: Option<bool>,
 }
 
 impl LlmConfig {
@@ -1000,6 +1005,7 @@ mod tests {
             max_context_size: None,
             custom_headers: BTreeMap::new(),
             streaming_enabled: None,
+            local_cli_isolation: None,
         }
     }
 

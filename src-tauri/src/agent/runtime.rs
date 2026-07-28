@@ -10,7 +10,9 @@ use uuid::Uuid;
 
 use crate::commands::search::SearchEmbeddingConfig;
 
+use super::answer_layer;
 use super::cancel::AgentCancellationToken;
+use super::cli_provider::{is_usable_for_cli_transport, ClaudeCliProvider};
 use super::context::{
     build_agent_context, collapse_whitespace, intent_label, load_explicit_context_files,
     load_project_context, trim_chars, AgentContextInput, BuiltAgentContext,
@@ -42,6 +44,13 @@ const MAX_SKILL_REFERENCE_BYTES: u64 = 256 * 1024;
 const MAX_USER_INPUT_FIELDS: usize = 12;
 const MAX_USER_INPUT_OPTIONS: usize = 8;
 const MAX_USER_INPUT_TEXT_CHARS: usize = 400;
+/// How many retrieved pages get their full body handed to the generator,
+/// and how much of each. Bounded because an unbounded body block would
+/// push the retrieval summary and conversation history out of a small
+/// model's context — the pages are ranked, so the tail is the cheap part
+/// to lose.
+const MAX_SYNTHESIS_PAGES: usize = 6;
+const MAX_SYNTHESIS_PAGE_CHARS: usize = 6000;
 const SHELL_APPROVAL_REQUIRED_OBSERVATION: &str = "shell.exec.approval_required";
 
 pub type AgentEventSink = Arc<dyn Fn(AgentEvent) + Send + Sync>;
@@ -1155,6 +1164,79 @@ impl AgentRuntime {
                 );
             }
         }
+        // Generation transport selection. `is_usable_for_backend_http` is
+        // false for CLI providers by design (they are subprocesses, not
+        // endpoints), which used to mean a project on `claude-code` had no
+        // generator at all and fell through to the ranked-listing template
+        // without ever invoking a model — QA finding F-8. Both transports
+        // are now first-class here; only the absence of *any* configured
+        // provider selects the fallback.
+        let config = self.llm_config.as_ref();
+        let generation_provider: Option<Box<dyn AgentLlmProvider>> =
+            match (config, select_generation_transport(config)) {
+                (Some(config), GenerationTransport::Http) => {
+                    Some(Box::new(LlmClient::new(config.clone())?))
+                }
+                (Some(config), GenerationTransport::Cli) => Some(Box::new(
+                    ClaudeCliProvider::new(config, self.project_path.clone()),
+                )),
+                _ => None,
+            };
+
+        // Page bodies for synthesis. The retrieval snippet window opens at
+        // the token match, which on these pages is usually the frontmatter
+        // block (QA finding F-5) — feeding snippets alone would hand the
+        // model the YAML header instead of the sentence that asserts the
+        // fact. Bodies are read only when something will actually consume
+        // them, and only for wiki pages the search already returned.
+        let mut wiki_bodies: Vec<Option<String>> = Vec::new();
+        if !references.is_empty() {
+            permission_policy.require(AgentCapability::ReadProject)?;
+            for reference in &references {
+                let body = if reference.kind == "wiki" {
+                    tools::read_wiki_page(&self.project_path, &reference.path).ok()
+                } else {
+                    None
+                };
+                wiki_bodies.push(body);
+            }
+            if generation_provider.is_some() {
+                let mut rendered = String::from("Retrieved page bodies (authoritative source for this answer):");
+                for (idx, reference) in references.iter().take(MAX_SYNTHESIS_PAGES).enumerate() {
+                    let Some(body) = wiki_bodies.get(idx).and_then(Option::as_deref) else {
+                        continue;
+                    };
+                    rendered.push_str(&format!(
+                        "\n\n--- {} ({}) ---\n{}",
+                        reference.title,
+                        reference.path,
+                        trim_chars(body, MAX_SYNTHESIS_PAGE_CHARS)
+                    ));
+                }
+                retrieval_parts.push(rendered);
+            }
+        }
+
+        // Assessed before generation so the warning is derived from the
+        // record, not from whatever the model chose to mention.
+        let privilege = answer_layer::assess(message, &references, &wiki_bodies);
+        if privilege.requires_warning() {
+            tool_emit_event(
+                &mut tool_events,
+                &mut events,
+                &event_sink,
+                AgentToolEvent {
+                    tool: "privilege.assess".to_string(),
+                    status: "completed".to_string(),
+                    detail: Some(format!(
+                        "{} production-excluded document(s); productionQuery={}",
+                        privilege.excluded.len(),
+                        privilege.query_asks_about_production
+                    )),
+                },
+            );
+        }
+
         let retrieval_summary = retrieval_parts.join("\n\n");
         let project_context = project_context_for_retrieval_mode(
             load_project_context(&self.project_path),
@@ -1162,7 +1244,7 @@ impl AgentRuntime {
         );
         let explicit_files =
             load_explicit_context_files(&self.project_path, &request.context_files).await;
-        let built_context = fit_context_to_model(
+        let mut built_context = fit_context_to_model(
             build_agent_context(AgentContextInput {
                 query: message,
                 project: &project_context,
@@ -1176,14 +1258,17 @@ impl AgentRuntime {
             }),
             self.llm_config.as_ref(),
         );
+        if generation_provider.is_some() {
+            // Appended after fitting so the honesty and citation rules can
+            // never be the text that gets truncated away under a tight
+            // context budget.
+            built_context
+                .system
+                .push_str(answer_layer::generation_directives());
+        }
 
-        let answer = if let Some(config) = self
-            .llm_config
-            .as_ref()
-            .filter(|cfg| cfg.is_usable_for_backend_http())
-        {
+        let generated = if let Some(client) = generation_provider.as_deref() {
             check_cancel(cancellation.as_ref())?;
-            let client = LlmClient::new(config.clone())?;
             tool_emit_event(
                 &mut tool_events,
                 &mut events,
@@ -1200,7 +1285,7 @@ impl AgentRuntime {
             );
             let generation = if event_sink.is_some() {
                 generate_with_cancellation_stream(
-                    &client,
+                    client,
                     &built_context.system,
                     &built_context.user,
                     &request.images,
@@ -1218,7 +1303,7 @@ impl AgentRuntime {
                 .await
             } else {
                 generate_with_cancellation(
-                    &client,
+                    client,
                     &built_context.system,
                     &built_context.user,
                     &request.images,
@@ -1238,7 +1323,7 @@ impl AgentRuntime {
                             detail: None,
                         },
                     );
-                    answer
+                    Some(answer)
                 }
                 Err(err) => {
                     tool_emit_event(
@@ -1262,8 +1347,17 @@ impl AgentRuntime {
                 }
             }
         } else {
-            retrieval_summary
+            None
         };
+
+        let answer = compose_answer(AnswerComposition {
+            query: message,
+            generated,
+            retrieval_summary,
+            references: &references,
+            searched_wiki: should_search_wiki,
+            privilege: &privilege,
+        });
         emit_event(
             &mut events,
             &event_sink,
@@ -3943,7 +4037,10 @@ fn tool_emit_event(
     tool_events.push(tool_event);
 }
 
-async fn generate_with_cancellation<P: AgentLlmProvider>(
+// `?Sized` so a boxed provider chosen at runtime (HTTP client vs CLI
+// subprocess) can be passed as `&dyn AgentLlmProvider` without cloning it
+// into a concrete type per transport.
+async fn generate_with_cancellation<P: AgentLlmProvider + ?Sized>(
     provider: &P,
     system: &str,
     user: &str,
@@ -3970,7 +4067,7 @@ async fn generate_with_cancellation_stream<P, F>(
     on_delta: F,
 ) -> Result<String, String>
 where
-    P: AgentLlmProvider,
+    P: AgentLlmProvider + ?Sized,
     F: FnMut(&str) + Send,
 {
     if let Some(token) = cancellation {
@@ -3986,6 +4083,93 @@ where
     }
 }
 
+/// How the backend Agent will reach a model for this turn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GenerationTransport {
+    /// An HTTP endpoint the runtime POSTs to.
+    Http,
+    /// A local CLI subprocess.
+    Cli,
+    /// No usable provider — the ranked-listing fallback.
+    None,
+}
+
+/// The F-8 fix in one function.
+///
+/// `is_usable_for_backend_http` is false for CLI providers by design, and
+/// the runtime used to treat that single predicate as "is there a model at
+/// all". A project configured with an active `claude-code` provider
+/// therefore reached generation with nothing to call and silently emitted
+/// a search-result template. Transport choice and provider *presence* are
+/// two different questions; this function keeps them apart.
+fn select_generation_transport(config: Option<&LlmConfig>) -> GenerationTransport {
+    match config {
+        Some(config) if config.is_usable_for_backend_http() => GenerationTransport::Http,
+        Some(config) if is_usable_for_cli_transport(config) => GenerationTransport::Cli,
+        _ => GenerationTransport::None,
+    }
+}
+
+/// Inputs to the final answer assembly. Grouped into a struct because the
+/// composition rules are the part of this file most likely to be revised,
+/// and threading six positional arguments through makes that risky.
+struct AnswerComposition<'a> {
+    query: &'a str,
+    /// `None` when no provider was available — the explicit fallback path.
+    generated: Option<String>,
+    retrieval_summary: String,
+    references: &'a [AgentReference],
+    searched_wiki: bool,
+    privilege: &'a answer_layer::PrivilegeAssessment,
+}
+
+/// Assemble the user-visible message.
+///
+/// Ordering is a control, not a presentation choice: the production
+/// warning is prepended here, after generation, so it cannot be omitted,
+/// softened, or buried by the model — and so it is present identically on
+/// the fallback path, where there is no model at all.
+fn compose_answer(input: AnswerComposition<'_>) -> String {
+    let AnswerComposition {
+        query,
+        generated,
+        retrieval_summary,
+        references,
+        searched_wiki,
+        privilege,
+    } = input;
+
+    let body = match generated {
+        Some(answer) if !answer.trim().is_empty() => {
+            let mut body = answer;
+            if let Some(citations) = answer_layer::render_citations(references) {
+                body.push_str(&citations);
+            }
+            body
+        }
+        // A wiki search that returned nothing is an absence claim, and it
+        // is the same claim whether or not a model was available to phrase
+        // it. Non-wiki turns keep the retrieval summary: "no wiki page"
+        // says nothing about a web or AnyTXT result.
+        _ if searched_wiki && references.is_empty() => answer_layer::absence_answer(query),
+        // Provider ran and returned nothing usable, with pages in hand.
+        // Fall back to the ranked listing rather than the raw retrieval
+        // summary: with references present the summary also carries the
+        // whole page bodies assembled for the model's context, and
+        // spilling those into the chat window is not an answer.
+        Some(_) if !references.is_empty() => build_retrieval_answer(query, references),
+        // No references means no body block was ever added, so the summary
+        // is safe to show — and it may carry web or AnyTXT results that
+        // the ranked wiki listing would discard.
+        Some(_) | None => retrieval_summary,
+    };
+
+    match answer_layer::render_warning_block(privilege) {
+        Some(warning) => format!("{warning}\n---\n\n{body}"),
+        None => body,
+    }
+}
+
 fn build_retrieval_answer(query: &str, references: &[AgentReference]) -> String {
     if references.is_empty() {
         return format!(
@@ -3993,8 +4177,15 @@ fn build_retrieval_answer(query: &str, references: &[AgentReference]) -> String 
         );
     }
 
+    // Deliberately "matched your search terms", not "relevant": with no
+    // model in the loop nothing has judged relevance, and the old wording
+    // asserted a relevance the surface had not established. QA saw six
+    // DO-NOT-PRODUCE pages presented as "relevant" to a production
+    // question; the ranking says they matched, nothing more.
     let mut out = format!(
-        "I searched the current LLM Wiki project for \"{query}\" and found {} relevant page(s):",
+        "No generation provider is configured, so this is a ranked search result rather than an \
+         answer. I searched the current LLM Wiki project for \"{query}\" and found {} page(s) \
+         matching your search terms. They have not been checked against your question:",
         references.len()
     );
     for (idx, reference) in references.iter().take(MAX_CHAT_SEARCH_RESULTS).enumerate() {
@@ -4080,6 +4271,451 @@ mod tests {
         );
         assert!(response.message.contains("Agent Runtime"));
         assert_eq!(response.tool_events[0].tool, "wiki.search");
+    }
+
+    /// A casefile-shaped project: one producible page, one marked work
+    /// product. Mirrors the mirrored-spine frontmatter the QA run hit.
+    fn casefile_project(name: &str) -> PathBuf {
+        let project = temp_project(name);
+        let documents = project.join("wiki").join("documents");
+        fs::create_dir_all(&documents).unwrap();
+        fs::write(
+            documents.join("TRN-0004.md"),
+            "---\ntitle: Transcript Notes TRN-0004\nprivilege: WorkProduct\nproduction: \"EXCLUDED — DO NOT PRODUCE\"\n---\n\n# Transcript Notes\n\nCounsel annotations on the deposition transcript.\n",
+        )
+        .unwrap();
+        fs::write(
+            documents.join("EVD-0019.md"),
+            "---\ntitle: Evidence EVD-0019\nprivilege: None\nproduction: Producible\n---\n\n# Evidence EVD-0019\n\n## What it proves\n\nEVD-0019 is the Chapel Royal marriage certificate, reference ESX146745, issued as an OFFICIAL COPY. It proves the marriage was solemnised at the Chapel Royal, and it upgrades EVD-0008 from grade G2 to grade G1 because an official copy supersedes the uncertified transcription.\n",
+        )
+        .unwrap();
+        project
+    }
+
+    /// Task 3 / QA finding F-4. The production question must open with the
+    /// warning block naming the predicate and the marked document, ahead of
+    /// any content — and on the fallback path, where no model exists to be
+    /// asked nicely to include it.
+    #[tokio::test]
+    async fn production_question_opens_with_the_warning_block_in_fallback_mode() {
+        let project = casefile_project("production-question");
+        let runtime = AgentRuntime::new(
+            "project-1",
+            project.to_string_lossy(),
+            None,
+            // No LLM config at all: this is the explicit fallback path.
+            None,
+            None,
+            None,
+        );
+        let response = runtime
+            .run_once(AgentChatRequest {
+                message: "Can we produce transcript notes to opposing counsel?".to_string(),
+                session_id: Some("s1".to_string()),
+                mode: AgentMode::Standard,
+                tools: AgentToolOptions {
+                    wiki: true,
+                    web: false,
+                    anytxt: false,
+                },
+                top_k: Some(5),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        let message = &response.message;
+        assert!(
+            message.starts_with("⚠️ **PRODUCTION WARNING"),
+            "warning must be the first thing in the response, got: {message}"
+        );
+        assert!(message.contains("wiki/documents/TRN-0004.md"), "{message}");
+        assert!(message.contains("privilege: WorkProduct"), "{message}");
+        assert!(message.contains("EXCLUDED"), "{message}");
+        // Perimeter doctrine: warn, never hide. The marked document stays
+        // in the reference set exactly as before.
+        assert!(
+            response
+                .references
+                .iter()
+                .any(|r| r.path == "wiki/documents/TRN-0004.md"),
+            "the marked document must still be returned to internal users"
+        );
+        // The warning must precede the content, not trail it.
+        let warning_end = message.find("---\n\n").expect("warning separator");
+        let doc_mention = message
+            .rfind("wiki/documents/TRN-0004.md")
+            .expect("document listed");
+        assert!(warning_end < doc_mention || message[..warning_end].contains("TRN-0004"));
+        assert!(response
+            .tool_events
+            .iter()
+            .any(|event| event.tool == "privilege.assess"));
+    }
+
+    /// Task 2. A question the wiki has no page for must be answered as an
+    /// absence, not as a list of pages that happened to tokenise nearby.
+    #[tokio::test]
+    async fn question_with_no_matching_page_states_absence() {
+        let project = casefile_project("not-in-file");
+        let runtime = AgentRuntime::new(
+            "project-1",
+            project.to_string_lossy(),
+            None,
+            None,
+            None,
+            None,
+        );
+        let response = runtime
+            .run_once(AgentChatRequest {
+                message: "zzqqxx nonexistent orbital telemetry".to_string(),
+                session_id: Some("s1".to_string()),
+                mode: AgentMode::Standard,
+                tools: AgentToolOptions {
+                    wiki: true,
+                    web: false,
+                    anytxt: false,
+                },
+                top_k: Some(5),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        assert!(response.references.is_empty());
+        assert!(
+            response.message.starts_with("**Not in the wiki.**"),
+            "absence must be stated plainly, got: {}",
+            response.message
+        );
+        assert!(response.message.contains("no page that states it"));
+        // It must not dress the corpus up as an answer.
+        assert!(!response.message.contains("EVD-0019"));
+    }
+
+    /// A neutral question against a clean page must stay clean: no warning
+    /// banner, no absence claim. Without this control the two tests above
+    /// would pass just as well if the layer warned on everything.
+    #[tokio::test]
+    async fn neutral_question_on_producible_page_gets_no_warning_and_no_absence_claim() {
+        let project = casefile_project("neutral");
+        let runtime = AgentRuntime::new(
+            "project-1",
+            project.to_string_lossy(),
+            None,
+            None,
+            None,
+            None,
+        );
+        let response = runtime
+            .run_once(AgentChatRequest {
+                message: "Chapel Royal certificate".to_string(),
+                session_id: Some("s1".to_string()),
+                mode: AgentMode::Standard,
+                tools: AgentToolOptions {
+                    wiki: true,
+                    web: false,
+                    anytxt: false,
+                },
+                top_k: Some(5),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        assert!(
+            response
+                .references
+                .iter()
+                .any(|r| r.path == "wiki/documents/EVD-0019.md"),
+            "expected the producible page to rank, got {:?}",
+            response.references
+        );
+        assert!(!response.message.contains("PRODUCTION WARNING"), "{}", response.message);
+        assert!(!response.message.starts_with("**Not in the wiki.**"));
+        assert!(!response
+            .tool_events
+            .iter()
+            .any(|event| event.tool == "privilege.assess"));
+    }
+
+    /// Evidence generator for the PR. Runs the three answer shapes and
+    /// prints each composed message verbatim, so the transcripts in the PR
+    /// body are captured output rather than hand-written prose:
+    ///     cargo test -p llm-wiki answer_shape_transcripts -- --nocapture
+    #[tokio::test]
+    async fn answer_shape_transcripts() {
+        let project = casefile_project("transcripts");
+        let runtime = AgentRuntime::new(
+            "project-1",
+            project.to_string_lossy(),
+            None,
+            None,
+            None,
+            None,
+        );
+        for (label, question) in [
+            (
+                "PRODUCTION QUESTION",
+                "Can we produce transcript notes to opposing counsel?",
+            ),
+            ("NOT-IN-FILE", "zzqqxx nonexistent orbital telemetry"),
+            ("FACTUAL (clean)", "Chapel Royal certificate"),
+        ] {
+            let response = runtime
+                .run_once(AgentChatRequest {
+                    message: question.to_string(),
+                    session_id: Some("transcript".to_string()),
+                    mode: AgentMode::Standard,
+                    tools: AgentToolOptions {
+                        wiki: true,
+                        web: false,
+                        anytxt: false,
+                    },
+                    top_k: Some(5),
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+            println!("\n===== {label} =====\nQ: {question}\n---\n{}\n", response.message);
+            assert!(!response.message.trim().is_empty());
+        }
+    }
+
+    /// Regression guard for QA finding F-8. Before this change an active
+    /// `claude-code` provider selected no transport at all, which is why
+    /// the chat route answered in ~70ms having invoked nothing.
+    #[test]
+    fn claude_code_config_selects_the_cli_transport_not_the_fallback() {
+        let cli: LlmConfig = serde_json::from_value(serde_json::json!({
+            "provider": "claude-code",
+            "model": "sonnet",
+            "apiKey": "",
+        }))
+        .unwrap();
+        assert_eq!(
+            select_generation_transport(Some(&cli)),
+            GenerationTransport::Cli
+        );
+
+        let http: LlmConfig = serde_json::from_value(serde_json::json!({
+            "provider": "anthropic",
+            "model": "claude-sonnet-5",
+            "apiKey": "sk-test",
+        }))
+        .unwrap();
+        assert_eq!(
+            select_generation_transport(Some(&http)),
+            GenerationTransport::Http
+        );
+
+        // Genuinely unconfigured providers must still select the fallback,
+        // otherwise every project would try to spawn a subprocess.
+        let unusable: LlmConfig = serde_json::from_value(serde_json::json!({
+            "provider": "anthropic",
+            "model": "claude-sonnet-5",
+            "apiKey": "",
+        }))
+        .unwrap();
+        assert_eq!(
+            select_generation_transport(Some(&unusable)),
+            GenerationTransport::None
+        );
+        assert_eq!(
+            select_generation_transport(None),
+            GenerationTransport::None
+        );
+    }
+
+    /// End-to-end proof of the whole order against a live provider:
+    /// retrieval → `claude-code` subprocess → synthesized prose with page
+    /// citations, and the production warning ahead of generated content.
+    /// Ignored by default (spawns the real CLI, consumes the developer's
+    /// Claude Code session). Run with:
+    ///     cargo test -p llm-wiki live_claude_code -- --ignored --nocapture
+    #[tokio::test]
+    #[ignore = "spawns the real claude CLI and uses the developer's session"]
+    async fn live_claude_code_answers_with_cited_prose_and_warns_on_production() {
+        let project = casefile_project("live-claude");
+        let config: LlmConfig = serde_json::from_value(serde_json::json!({
+            "provider": "claude-code",
+            "model": "haiku",
+            "apiKey": "",
+        }))
+        .unwrap();
+        assert_eq!(
+            select_generation_transport(Some(&config)),
+            GenerationTransport::Cli
+        );
+        let runtime = AgentRuntime::new(
+            "project-1",
+            project.to_string_lossy(),
+            None,
+            Some(config),
+            None,
+            None,
+        );
+
+        let ask = |question: &'static str| {
+            let runtime = runtime.clone();
+            async move {
+                runtime
+                    .run_once(AgentChatRequest {
+                        message: question.to_string(),
+                        session_id: Some("live".to_string()),
+                        mode: AgentMode::Standard,
+                        tools: AgentToolOptions {
+                            wiki: true,
+                            web: false,
+                            anytxt: false,
+                        },
+                        top_k: Some(5),
+                        ..Default::default()
+                    })
+                    .await
+                    .unwrap()
+            }
+        };
+
+        let factual = ask("What does EVD-0019 prove?").await;
+        println!("\n===== LIVE · FACTUAL =====\n{}\n", factual.message);
+        assert!(factual
+            .tool_events
+            .iter()
+            .any(|e| e.tool == "llm.generate" && e.status == "completed"));
+        assert!(
+            factual.message.contains("wiki/documents/EVD-0019.md"),
+            "generated answer must cite the page it used"
+        );
+        // Prose, not the ranked-listing template.
+        assert!(!factual.message.contains("ranked search result"));
+        // Synthesis, not an absence dodge: the page states the fact, so the
+        // answer must assert it rather than say it is missing.
+        assert!(
+            !factual.message.to_lowercase().contains("not in the wiki"),
+            "the page states what EVD-0019 proves; the answer must say so"
+        );
+        assert!(
+            factual.message.contains("ESX146745") || factual.message.contains("Chapel Royal"),
+            "answer must carry the fact from the page"
+        );
+
+        let production = ask("Can we produce the transcript notes to opposing counsel?").await;
+        println!("\n===== LIVE · PRODUCTION =====\n{}\n", production.message);
+        assert!(
+            production.message.starts_with("⚠️ **PRODUCTION WARNING"),
+            "warning must precede generated content too, got: {}",
+            production.message
+        );
+        assert!(production.message.contains("wiki/documents/TRN-0004.md"));
+
+        let absent = ask("What is the orbital telemetry cadence for satellite zzqqxx?").await;
+        println!("\n===== LIVE · NOT-IN-FILE =====\n{}\n", absent.message);
+        assert!(
+            absent.message.to_lowercase().contains("not in the wiki"),
+            "absence must be stated, got: {}",
+            absent.message
+        );
+    }
+
+    #[test]
+    fn fallback_listing_does_not_assert_relevance() {
+        let references = vec![AgentReference {
+            title: "Transcript Notes".to_string(),
+            path: "wiki/documents/TRN-0004.md".to_string(),
+            kind: "wiki".to_string(),
+            snippet: None,
+            score: Some(38.0),
+            knowledge_context: None,
+        }];
+        let listing = build_retrieval_answer("can we produce this", &references);
+        assert!(listing.contains("matching your search terms"));
+        assert!(listing.contains("not been checked against your question"));
+        // The old wording claimed relevance the surface never established.
+        assert!(!listing.contains("relevant page"));
+    }
+
+    #[test]
+    fn generated_answer_keeps_citations_and_is_preceded_by_the_warning() {
+        let references = vec![AgentReference {
+            title: "Transcript Notes".to_string(),
+            path: "wiki/documents/TRN-0004.md".to_string(),
+            kind: "wiki".to_string(),
+            snippet: None,
+            score: Some(38.0),
+            knowledge_context: None,
+        }];
+        let privilege = answer_layer::assess(
+            "can we produce this",
+            &references,
+            &[Some("---\nprivilege: WorkProduct\n---\n".to_string())],
+        );
+        let composed = compose_answer(AnswerComposition {
+            query: "can we produce this",
+            generated: Some("The notes are counsel annotations.".to_string()),
+            retrieval_summary: "unused".to_string(),
+            references: &references,
+            searched_wiki: true,
+            privilege: &privilege,
+        });
+        assert!(composed.starts_with("⚠️ **PRODUCTION WARNING"));
+        assert!(composed.contains("The notes are counsel annotations."));
+        assert!(composed.contains("**Pages consulted**"));
+        assert!(!composed.contains("unused"));
+    }
+
+    #[test]
+    fn empty_generation_falls_back_instead_of_returning_a_blank_answer() {
+        let privilege = answer_layer::PrivilegeAssessment::default();
+        let composed = compose_answer(AnswerComposition {
+            query: "anything",
+            generated: Some("   ".to_string()),
+            retrieval_summary: "ranked listing".to_string(),
+            references: &[],
+            searched_wiki: false,
+            privilege: &privilege,
+        });
+        assert_eq!(composed, "ranked listing");
+    }
+
+    /// The retrieval summary handed to the model contains whole page
+    /// bodies. If the provider returns nothing, those bodies must not be
+    /// dumped into the chat window in place of an answer.
+    #[test]
+    fn blank_generation_with_references_shows_the_listing_not_the_page_bodies() {
+        let references = vec![AgentReference {
+            title: "Evidence".to_string(),
+            path: "wiki/documents/EVD-0019.md".to_string(),
+            kind: "wiki".to_string(),
+            snippet: None,
+            score: Some(12.0),
+            knowledge_context: None,
+        }];
+        let privilege = answer_layer::PrivilegeAssessment::default();
+        let composed = compose_answer(AnswerComposition {
+            query: "chapel royal",
+            generated: Some(String::new()),
+            retrieval_summary: "Retrieved page bodies (authoritative source for this answer): SECRET BODY TEXT".to_string(),
+            references: &references,
+            searched_wiki: true,
+            privilege: &privilege,
+        });
+        assert!(!composed.contains("SECRET BODY TEXT"), "{composed}");
+        assert!(composed.contains("wiki/documents/EVD-0019.md"));
+    }
+
+    #[test]
+    fn absence_is_not_claimed_when_the_wiki_was_never_searched() {
+        let privilege = answer_layer::PrivilegeAssessment::default();
+        let composed = compose_answer(AnswerComposition {
+            query: "latest news",
+            generated: None,
+            retrieval_summary: "web results here".to_string(),
+            references: &[],
+            searched_wiki: false,
+            privilege: &privilege,
+        });
+        assert_eq!(composed, "web results here");
     }
 
     #[tokio::test]
@@ -4188,6 +4824,7 @@ mod tests {
             max_context_size: Some(8_000),
             custom_headers: Default::default(),
             streaming_enabled: None,
+            local_cli_isolation: None,
         };
         let fitted = fit_context_to_model(context, Some(&config));
         assert!(fitted.system.contains("system"));
@@ -4214,6 +4851,7 @@ mod tests {
             max_context_size: Some(8_000),
             custom_headers: Default::default(),
             streaming_enabled: None,
+            local_cli_isolation: None,
         };
 
         let fitted = fit_context_to_model(context, Some(&config));
