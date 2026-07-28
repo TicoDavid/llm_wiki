@@ -45,8 +45,46 @@ fn project_root_for(path: &Path) -> Option<PathBuf> {
     None
 }
 
+/// Reduce a path to the platform-neutral string the history key is derived
+/// from: drop any Windows verbatim (`\\?\`) prefix and spell every separator as
+/// `/`, so a path that came back from `canonicalize()` and the raw forward-slash
+/// path the UI hands us reduce to the same text.
+fn key_text(path: &Path) -> String {
+    let text = path.to_string_lossy().replace('\\', "/");
+    match text.strip_prefix("//?/") {
+        // `\\?\UNC\server\share` is the verbatim spelling of `\\server\share`.
+        Some(rest) => match rest.strip_prefix("UNC/") {
+            Some(share) => format!("//{share}"),
+            None => rest.to_string(),
+        },
+        None => text,
+    }
+}
+
+/// Address the history store by a key both sides of the feature agree on.
+///
+/// The writer is handed the caller's path as given while the readers go through
+/// `checked_file()`, which canonicalises. Hashing whatever string each side
+/// happened to hold made them disagree in two ways: `canonicalize()` rewrites
+/// every separator to `\` and returns a `\\?\` form on Windows, and it resolves
+/// symlinks on every platform. Either way the reader opened a store the writer
+/// never wrote. Resolving and normalising here — identically, whichever side
+/// calls — is what keeps the two in sync; callers may pass any spelling.
 fn history_path(root: &Path, path: &Path) -> PathBuf {
-    let relative = path.strip_prefix(root).unwrap_or(path).to_string_lossy();
+    // All-or-nothing: mixing a resolved path with an unresolved root would
+    // reintroduce exactly the mismatch this function exists to prevent.
+    let (root_key, path_key) = match (root.canonicalize(), path.canonicalize()) {
+        (Ok(resolved_root), Ok(resolved_path)) => {
+            (key_text(&resolved_root), key_text(&resolved_path))
+        }
+        _ => (key_text(root), key_text(path)),
+    };
+    let relative = match path_key.strip_prefix(root_key.trim_end_matches('/')) {
+        // Require a separator so `/proj-old/page.md` is not read as living
+        // under `/proj`.
+        Some(rest) if rest.starts_with('/') => rest.trim_start_matches('/'),
+        _ => path_key.as_str(),
+    };
     // Fixed FNV-1a keeps history addresses stable across Rust/toolchain upgrades.
     let mut hash = 0xcbf29ce484222325_u64;
     for byte in relative.as_bytes() {
@@ -197,6 +235,96 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(restored.first().unwrap().tool, "history.restore");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// The writer keys the store off the path as given; the readers key it off
+    /// `canonicalize()`. Every spelling of one logical file must therefore land
+    /// on one key, or history is recorded at an address nothing ever reads.
+    /// These paths do not exist, so this exercises the string normalisation on
+    /// every lane rather than whatever the local filesystem happens to resolve.
+    #[test]
+    fn history_key_is_identical_across_path_spellings() {
+        let key_of = |root: &str, file: &str| {
+            history_path(Path::new(root), Path::new(file))
+                .file_name()
+                .expect("history path has a file name")
+                .to_string_lossy()
+                .into_owned()
+        };
+
+        // Pinned, not merely self-consistent: this is FNV-1a of `wiki/page.md`,
+        // the key the writer has always produced. Existing stores stay readable.
+        let expected = "915f2613ee9ad2ac.json";
+        assert_eq!(key_of("/llm-wiki-absent", "/llm-wiki-absent/wiki/page.md"), expected);
+
+        for (root_form, file_form) in [
+            // forward slash, as `build_tree` emits and the UI passes through
+            ("C:/llm-wiki-absent", "C:/llm-wiki-absent/wiki/page.md"),
+            // plain backslash
+            (r"C:\llm-wiki-absent", r"C:\llm-wiki-absent\wiki\page.md"),
+            // the mixed spelling `root.join("wiki/page.md")` really produces
+            (r"C:\llm-wiki-absent", r"C:\llm-wiki-absent\wiki/page.md"),
+            // the verbatim long-name form `canonicalize()` returns on Windows
+            (r"\\?\C:\llm-wiki-absent", r"\\?\C:\llm-wiki-absent\wiki\page.md"),
+            // writer spelling vs reader spelling — the actual divergence
+            ("C:/llm-wiki-absent", r"\\?\C:\llm-wiki-absent\wiki\page.md"),
+            // verbatim UNC, which spells `\\server\share`
+            (r"\\?\UNC\server\share", r"\\server\share\wiki\page.md"),
+        ] {
+            assert_eq!(
+                key_of(root_form, file_form),
+                expected,
+                "`{file_form}` under `{root_form}` must key the same store"
+            );
+        }
+
+        // A shared textual prefix is not containment: the separator is required.
+        assert_ne!(
+            key_of("/llm-wiki-absent", "/llm-wiki-absent-other/wiki/page.md"),
+            expected,
+        );
+    }
+
+    /// The PR 4 probe, kept as a permanent guard. `canonicalize()` resolving a
+    /// symlink rewrites the *relative* portion of the path, which is the same
+    /// writer/reader divergence Windows hits unconditionally through separator
+    /// rewriting. Keeping it here holds the bug class covered on the unix lanes.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn records_and_restores_through_a_symlinked_directory() {
+        let root = std::env::temp_dir().join(format!("llm-wiki-history-link-{}", Uuid::new_v4()));
+        fs::create_dir_all(root.join(".llm-wiki")).unwrap();
+        fs::create_dir_all(root.join("real")).unwrap();
+        std::os::unix::fs::symlink("real", root.join("wiki")).unwrap();
+
+        // The writer is handed `wiki/page.md`; the readers canonicalise it to
+        // `real/page.md`. Before the fix those hashed to different stores.
+        let file = root.join("wiki/page.md");
+        fs::write(&file, "before").unwrap();
+        record_file_version(&file, "baseline", "before.test");
+        fs::write(&file, "after").unwrap();
+        record_file_version(&file, "agent", "test.write");
+
+        let entries = list_file_history(
+            root.to_string_lossy().into_owned(),
+            file.to_string_lossy().into_owned(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(entries.len(), 2, "reader must see what the writer recorded");
+        let old = entries
+            .iter()
+            .find(|entry| entry.content == "before")
+            .unwrap();
+        restore_file_history(
+            root.to_string_lossy().into_owned(),
+            file.to_string_lossy().into_owned(),
+            old.id.clone(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(fs::read_to_string(&file).unwrap(), "before");
         let _ = fs::remove_dir_all(root);
     }
 }
